@@ -25,17 +25,31 @@ st.caption(
     "the duration of a planned Yellow Taxi trip."
 )
 
+# Resolve paths relative to the GitHub project.
+# pages/ -> streamlit/ -> project root
+PAGE_DIR = Path(__file__).resolve().parent
+STREAMLIT_DIR = PAGE_DIR.parent
+PROJECT_ROOT = STREAMLIT_DIR.parent
+
 MODEL_PATH = Path(
     os.getenv(
         "TRIP_DURATION_MODEL_PATH",
-        "/app/ml_artifacts/trip_duration_model.pkl",
+        str(
+            PROJECT_ROOT
+            / "ml_artifacts"
+            / "trip_duration_model.pkl"
+        ),
     )
 )
 
 METRICS_PATH = Path(
     os.getenv(
         "TRIP_DURATION_METRICS_PATH",
-        "/app/ml_artifacts/trip_duration_model_metrics.json",
+        str(
+            PROJECT_ROOT
+            / "ml_artifacts"
+            / "trip_duration_model_metrics.json"
+        ),
     )
 )
 
