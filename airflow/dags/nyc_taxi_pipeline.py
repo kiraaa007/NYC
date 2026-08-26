@@ -135,6 +135,104 @@ def service_file_checksum(service: str, path: str) -> str:
     return output.split()[0]
 
 
+def ml_trainer_image_fingerprint() -> str:
+    """Use the built trainer image ID as the portable-model code version."""
+    client = docker_client()
+    containers = client.containers.list(
+        all=True,
+        filters={
+            "label": "com.docker.compose.service=ml-trainer",
+        },
+    )
+    if containers:
+        return containers[0].image.id
+
+    try:
+        return client.images.get("nyc-taxi-bigdata-ml-trainer").id
+    except Exception as exc:
+        raise AirflowException(
+            "The ml-trainer image has not been built. Run: "
+            "docker compose --profile training build ml-trainer"
+        ) from exc
+
+
+def run_ml_trainer():
+    """Run the existing one-shot ml-trainer service/container on demand."""
+    client = docker_client()
+    containers = client.containers.list(
+        all=True,
+        filters={
+            "label": "com.docker.compose.service=ml-trainer",
+        },
+    )
+
+    created_here = False
+    container = containers[0] if containers else None
+
+    if container is None:
+        try:
+            image = client.images.get("nyc-taxi-bigdata-ml-trainer")
+        except Exception as exc:
+            raise AirflowException(
+                "The ml-trainer image is missing. Run: "
+                "docker compose --profile training build ml-trainer"
+            ) from exc
+
+        _, spark = find_service_container("spark-master")
+        artifact_mount = next(
+            (
+                m
+                for m in spark.attrs.get("Mounts", [])
+                if m.get("Destination") == "/opt/ml-artifacts"
+            ),
+            None,
+        )
+        if artifact_mount is None:
+            raise AirflowException(
+                "Could not determine the host ml_artifacts mount from "
+                "spark-master."
+            )
+
+        container = client.containers.create(
+            image=image.id,
+            command=["python", "/trainer/train_deployable_model.py"],
+            volumes={
+                artifact_mount["Source"]: {
+                    "bind": "/artifacts",
+                    "mode": "rw",
+                }
+            },
+            network="nyc-taxi-bigdata-network",
+        )
+        created_here = True
+
+    if container.status == "running":
+        raise AirflowException("ml-trainer is already running.")
+
+    container.start()
+    result = container.wait(timeout=3600)
+    logs = container.logs(stdout=True, stderr=True).decode(
+        "utf-8", errors="replace"
+    )
+    for line in logs.rstrip().splitlines():
+        log.info("[ml-trainer] %s", line)
+
+    if created_here:
+        try:
+            container.remove()
+        except Exception:
+            log.warning("Could not remove temporary ml-trainer container.")
+
+    if result.get("StatusCode") != 0:
+        raise AirflowException(
+            f"ml-trainer failed with exit code {result.get('StatusCode')}."
+        )
+    if "PORTABLE MODEL TRAINING COMPLETE" not in logs:
+        raise AirflowException(
+            "ml-trainer finished but completion text was not found."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Persistent stage state in HDFS
 # ---------------------------------------------------------------------------
@@ -489,21 +587,14 @@ STAGES = {
     },
     "portable_model": {
         "parent": "ml_export",
-        "code": [
-            ("spark-master", "/opt/ml-training/train_deployable_model.py"),
-            ("spark-master", "/opt/ml-training/requirements.txt"),
-        ],
+        "code": [],
         "output": (
             "spark-master",
             "[ -s /opt/ml-artifacts/trip_duration_model.pkl ] "
             "&& [ -s /opt/ml-artifacts/trip_duration_model_metrics.json ] "
             "&& [ -s /opt/ml-artifacts/trip_duration_model_features.json ]",
         ),
-        "build": (
-            "ml-trainer",
-            ["python", "/trainer/train_deployable_model.py"],
-            "PORTABLE MODEL TRAINING COMPLETE",
-        ),
+        "build_callable": run_ml_trainer,
     },
 }
 
@@ -521,7 +612,9 @@ def desired_stage_fingerprint(stage: str) -> str:
         service_file_checksum(service, path)
         for service, path in spec["code"]
     ]
-    return fingerprint(f"{stage}-v3", parent_fp, *code_fps)
+    if stage == "portable_model":
+        code_fps.append(ml_trainer_image_fingerprint())
+    return fingerprint(f"{stage}-v4", parent_fp, *code_fps)
 
 
 def stage_output_exists(stage: str) -> bool:
@@ -561,7 +654,10 @@ def ensure_stage(stage: str) -> str:
     log.info("%s will rebuild because %s.", stage, reason)
 
     spec = STAGES[stage]
-    execute_command(spec["build"])
+    if spec.get("build_callable"):
+        spec["build_callable"]()
+    else:
+        execute_command(spec["build"])
     if spec.get("validate"):
         execute_command(spec["validate"])
 
