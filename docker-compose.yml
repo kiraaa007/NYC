@@ -1,0 +1,469 @@
+name: nyc-taxi-bigdata
+
+services:
+
+  namenode:
+    image: apache/hadoop:3.5.0
+    container_name: namenode
+    hostname: namenode
+
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        sudo mkdir -p /hadoop/dfs/name
+        sudo chown -R hadoop:users /hadoop/dfs/name
+
+        if [ ! -f /hadoop/dfs/name/current/VERSION ]; then
+          echo "Formatting HDFS NameNode for first use..."
+          hdfs namenode -format -force -nonInteractive
+        fi
+
+        exec hdfs namenode
+
+    env_file:
+      - ./hadoop.env
+
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  datanode:
+    image: apache/hadoop:3.5.0
+    container_name: datanode
+    hostname: datanode
+
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        sudo mkdir -p /hadoop/dfs/data
+        sudo chown -R hadoop:users /hadoop/dfs/data
+        exec hdfs datanode
+
+    env_file:
+      - ./hadoop.env
+
+    depends_on:
+      - namenode
+
+    ports:
+      - "9864:9864"
+
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  kafka:
+    image: apache/kafka:3.9.2
+    container_name: kafka
+    hostname: kafka
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_NUM_PARTITIONS: 3
+
+    ports:
+      - "9094:9094"
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  kafka-init:
+    image: apache/kafka:3.9.2
+    container_name: kafka-init
+
+    depends_on:
+      - kafka
+
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        echo "Waiting for Kafka..."
+
+        until /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --list >/dev/null 2>&1; do
+
+          sleep 2
+
+        done
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic nyc_taxi_stream \
+          --partitions 3 \
+          --replication-factor 1
+
+        echo "Kafka topic nyc_taxi_stream is ready."
+
+    networks:
+      - bigdata
+
+    restart: "no"
+
+
+  spark-master:
+    image: spark:3.5.8
+    container_name: spark-master
+    hostname: spark-master
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+
+      KAFKA_STREAM_TOPIC: nyc_taxi_stream
+
+      STREAM_BRONZE_PATH: hdfs://namenode:9000/nyc-taxi/bronze/streaming
+
+      STREAM_CHECKPOINT_PATH: hdfs://namenode:9000/nyc-taxi/checkpoints/streaming_ingestion
+
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+
+    volumes:
+      # Existing Spark scripts
+      - ./spark:/opt/project:ro
+
+      # Exported Gold tables for Streamlit
+      - ./streamlit/data:/opt/dashboard-data
+
+      # ML training data + final .pkl artifacts
+      - ./ml_artifacts:/opt/ml-artifacts
+
+    depends_on:
+      - namenode
+      - kafka
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  spark-worker:
+    image: spark:3.5.8
+    container_name: spark-worker
+    hostname: spark-worker
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+
+    ports:
+      - "8081:8081"
+
+    depends_on:
+      - spark-master
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  ingestion:
+    build:
+      context: ./ingestion
+
+    container_name: ingestion
+    hostname: ingestion
+
+    command:
+      - sleep
+      - infinity
+
+    environment:
+      HDFS_WEB_URL: http://namenode:9870
+
+      HDFS_USER: root
+
+      BATCH_BRONZE_PATH: hdfs://namenode:9000/nyc-taxi/bronze/batch
+
+      REFERENCE_HDFS_PATH: hdfs://namenode:9000/nyc-taxi/reference
+
+      KAFKA_BOOTSTRAP: kafka:9092
+
+      KAFKA_STREAM_TOPIC: nyc_taxi_stream
+
+      STREAMING_MONTH: ${STREAMING_MONTH:-2025-01}
+
+    volumes:
+      - ./ingestion:/opt/project:ro
+      - "${NYC_DATA_PATH}:/data:ro"
+
+    depends_on:
+      - namenode
+      - datanode
+      - kafka
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  airflow-postgres:
+    image: postgres:16
+    container_name: nyc-airflow-postgres
+    hostname: airflow-postgres
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  airflow-init:
+    image: apache/airflow:2.10.5
+    container_name: nyc-airflow-init
+
+    depends_on:
+      - airflow-postgres
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      _PIP_ADDITIONAL_REQUIREMENTS: "docker==7.1.0"
+
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+
+    networks:
+      - bigdata
+
+    restart: "no"
+
+
+  airflow-webserver:
+    image: apache/airflow:2.10.5
+    container_name: nyc-airflow-webserver
+    hostname: airflow-webserver
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      _PIP_ADDITIONAL_REQUIREMENTS: "docker==7.1.0"
+
+    command: webserver
+
+    ports:
+      - "8082:8080"
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.5
+    container_name: nyc-airflow-scheduler
+    hostname: airflow-scheduler
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      _PIP_ADDITIONAL_REQUIREMENTS: "docker==7.1.0"
+
+    command: scheduler
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------
+  # ML TRAINING
+  #
+  # This container trains the portable deployment model and
+  # saves:
+  #
+  # ml_artifacts/trip_duration_model.pkl
+  #
+  # It does NOT run permanently.
+  # ---------------------------------------------------------
+
+  ml-trainer:
+    build:
+      context: ./ml_training
+
+    container_name: nyc-ml-trainer
+
+    volumes:
+      - ./ml_artifacts:/artifacts
+
+    profiles:
+      - training
+
+    restart: "no"
+
+
+  # ---------------------------------------------------------
+  # STREAMLIT DASHBOARD
+  #
+  # Pages:
+  #   Overview
+  #   NYC Taxi Zone Map
+  #   Demand Patterns
+  #   Trip Duration Predictor
+  #
+  # The ML predictor loads the trained .pkl model directly.
+  # ---------------------------------------------------------
+
+  streamlit-dashboard:
+    build:
+      context: ./streamlit
+
+    container_name: nyc-streamlit-dashboard
+    hostname: streamlit-dashboard
+
+    environment:
+      DASHBOARD_DATA_DIR: /app/data
+
+      NYC_DATA_DIR: /data
+
+      TRIP_DURATION_MODEL_PATH: /app/ml_artifacts/trip_duration_model.pkl
+
+      TRIP_DURATION_METRICS_PATH: /app/ml_artifacts/trip_duration_model_metrics.json
+
+    volumes:
+      # Streamlit application
+      - ./streamlit:/app
+
+      # Trained ML model
+      - ./ml_artifacts:/app/ml_artifacts:ro
+
+      # Taxi Zone Lookup + shapefile
+      - "${NYC_DATA_PATH}:/data:ro"
+
+    ports:
+      - "8501:8501"
+
+    networks:
+      - bigdata
+
+    restart: unless-stopped
+
+
+networks:
+
+  bigdata:
+    name: nyc-taxi-bigdata-network
+
+
+volumes:
+
+  namenode_data:
+
+  datanode_data:
+
+  airflow_postgres_data:

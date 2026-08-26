@@ -1,0 +1,35 @@
+# Local environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Airflow generated files
+airflow/logs/
+airflow/**/*.log
+
+# Exported dashboard data
+streamlit/data/
+
+# Exported ML training/test data
+ml_artifacts/data/
+
+# Spark temporary files
+.sparkStaging/
+metastore_db/
+derby.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp

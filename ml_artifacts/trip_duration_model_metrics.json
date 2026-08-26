@@ -1,0 +1,11 @@
+{
+  "model_type": "HistGradientBoostingRegressor",
+  "artifact": "trip_duration_model.pkl",
+  "training_rows": 841051,
+  "test_rows": 143109,
+  "mae_minutes": 4.4151619828892725,
+  "rmse_minutes": 6.996239396590539,
+  "r2": 0.7688292588057939,
+  "training_seconds": 5.600330352783203,
+  "test_period": "2025-12"
+}

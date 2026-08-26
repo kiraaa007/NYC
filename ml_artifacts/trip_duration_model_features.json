@@ -1,0 +1,29 @@
+{
+  "target": "trip_duration_minutes",
+  "categorical_features": [
+    "pickup_location_id",
+    "dropoff_location_id",
+    "rate_code_id",
+    "pickup_day_of_week_num"
+  ],
+  "numeric_features": [
+    "passenger_count",
+    "trip_distance",
+    "pickup_hour",
+    "pickup_month",
+    "is_weekend",
+    "is_rush_hour",
+    "pickup_hour_sin",
+    "pickup_hour_cos",
+    "pickup_month_sin",
+    "pickup_month_cos"
+  ],
+  "prediction_inputs": [
+    "pickup_location_id",
+    "dropoff_location_id",
+    "passenger_count",
+    "estimated_trip_distance",
+    "rate_code_id",
+    "pickup_datetime"
+  ]
+}
