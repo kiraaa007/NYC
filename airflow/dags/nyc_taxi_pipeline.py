@@ -45,7 +45,6 @@ REQUIRED_SERVICES = {
 # ---------------------------------------------------------------------------
 # Docker helpers
 # ---------------------------------------------------------------------------
-
 def docker_client():
     try:
         client = docker.from_env()
@@ -101,6 +100,7 @@ def exec_in_service(
 
     result = client.api.exec_inspect(exec_id)
     output = "".join(output_parts)
+
     if result.get("ExitCode") != 0:
         raise AirflowException(
             f"Command failed in service {service} "
@@ -136,13 +136,10 @@ def service_file_checksum(service: str, path: str) -> str:
 
 
 def ml_trainer_image_fingerprint() -> str:
-    """Use the built trainer image ID as the portable-model code version."""
     client = docker_client()
     containers = client.containers.list(
         all=True,
-        filters={
-            "label": "com.docker.compose.service=ml-trainer",
-        },
+        filters={"label": "com.docker.compose.service=ml-trainer"},
     )
     if containers:
         return containers[0].image.id
@@ -157,13 +154,11 @@ def ml_trainer_image_fingerprint() -> str:
 
 
 def run_ml_trainer():
-    """Run the existing one-shot ml-trainer service/container on demand."""
+    """Run the existing portable-model trainer only when its stage changed."""
     client = docker_client()
     containers = client.containers.list(
         all=True,
-        filters={
-            "label": "com.docker.compose.service=ml-trainer",
-        },
+        filters={"label": "com.docker.compose.service=ml-trainer"},
     )
 
     created_here = False
@@ -181,9 +176,9 @@ def run_ml_trainer():
         _, spark = find_service_container("spark-master")
         artifact_mount = next(
             (
-                m
-                for m in spark.attrs.get("Mounts", [])
-                if m.get("Destination") == "/opt/ml-artifacts"
+                mount
+                for mount in spark.attrs.get("Mounts", [])
+                if mount.get("Destination") == "/opt/ml-artifacts"
             ),
             None,
         )
@@ -206,6 +201,7 @@ def run_ml_trainer():
         )
         created_here = True
 
+    container.reload()
     if container.status == "running":
         raise AirflowException("ml-trainer is already running.")
 
@@ -234,9 +230,8 @@ def run_ml_trainer():
 
 
 # ---------------------------------------------------------------------------
-# Persistent stage state in HDFS
+# Persistent state helpers
 # ---------------------------------------------------------------------------
-
 def fingerprint(*parts: str) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
@@ -279,10 +274,18 @@ def shell_check(service: str, condition: str) -> bool:
     return output.splitlines()[-1] == "YES"
 
 
-# ---------------------------------------------------------------------------
-# Bronze readiness and fingerprint
-# ---------------------------------------------------------------------------
+def hdfs_has_parquet(path: str) -> str:
+    """Shell condition: path exists and contains at least one Parquet file."""
+    return (
+        f"hdfs dfs -test -e {path} && "
+        f"[ -n \"$(hdfs dfs -find {path} -name '*.parquet' "
+        "2>/dev/null | head -n 1)\" ]"
+    )
 
+
+# ---------------------------------------------------------------------------
+# Bronze readiness and lightweight durable fingerprint
+# ---------------------------------------------------------------------------
 def batch_and_reference_complete() -> bool:
     return shell_check(
         "namenode",
@@ -324,12 +327,7 @@ def ensure_batch_and_reference() -> str:
 
 
 def verify_streaming_bronze() -> str:
-    condition = (
-        f"hdfs dfs -test -e {STREAMING_BRONZE_HDFS} && "
-        f"[ $(hdfs dfs -ls {STREAMING_BRONZE_HDFS} 2>/dev/null "
-        "| grep -c '\\.parquet$' || true) -gt 0 ]"
-    )
-    if not shell_check("namenode", condition):
+    if not shell_check("namenode", hdfs_has_parquet(STREAMING_BRONZE_HDFS)):
         raise AirflowException(
             "Streaming Bronze is missing. Run nyc_taxi_streaming_ingestion "
             "first."
@@ -338,6 +336,14 @@ def verify_streaming_bronze() -> str:
 
 
 def compute_bronze_fingerprint() -> str:
+    """
+    Fingerprint durable Bronze state without checksumming every Parquet file.
+
+    Success-marker contents + HDFS count/size + streaming checkpoint/commit
+    state + reference checksums are enough to detect meaningful changes in
+    this finite course project and are dramatically faster than per-file
+    HDFS checksums.
+    """
     manifest = exec_in_service(
         "namenode",
         [
@@ -353,13 +359,11 @@ for d in $(hdfs dfs -ls /nyc-taxi/control/batch_loaded 2>/dev/null \
   hdfs dfs -cat "$d/_SUCCESS" 2>/dev/null || echo MISSING
 done
 
+echo "[batch_count]"
+hdfs dfs -count /nyc-taxi/bronze/batch 2>/dev/null || echo NONE
+
 echo "[batch_size]"
 hdfs dfs -du -s /nyc-taxi/bronze/batch 2>/dev/null || echo NONE
-
-echo "[batch_file_checksums]"
-for f in $(hdfs dfs -find /nyc-taxi/bronze/batch -name '*.parquet' 2>/dev/null | sort); do
-  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
-done
 
 echo "[stream_checkpoint]"
 latest=$(hdfs dfs -ls /nyc-taxi/checkpoints/streaming_ingestion/offsets \
@@ -378,25 +382,23 @@ else
   echo NONE
 fi
 
+echo "[stream_count]"
+hdfs dfs -count /nyc-taxi/bronze/streaming/year=2025/month=12 \
+  2>/dev/null || echo NONE
+
 echo "[stream_size]"
 hdfs dfs -du -s /nyc-taxi/bronze/streaming/year=2025/month=12 \
   2>/dev/null || echo NONE
-
-echo "[stream_file_checksums]"
-for f in $(hdfs dfs -find /nyc-taxi/bronze/streaming/year=2025/month=12 \
-  -name '*.parquet' 2>/dev/null | sort); do
-  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
-done
 
 echo "[lookup_checksum]"
 hdfs dfs -checksum /nyc-taxi/reference/taxi_zone_lookup.csv \
   2>/dev/null || echo NONE
 
-echo "[zone_reference_checksums]"
-for f in $(hdfs dfs -ls /nyc-taxi/reference/taxi_zones 2>/dev/null \
-  | awk '$1 !~ /^d/ && $8 != "" {print $8}' | sort); do
-  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
-done
+echo "[reference_count]"
+hdfs dfs -count /nyc-taxi/reference 2>/dev/null || echo NONE
+
+echo "[reference_size]"
+hdfs dfs -du -s /nyc-taxi/reference 2>/dev/null || echo NONE
 ''',
         ],
     )
@@ -408,7 +410,6 @@ done
 def snapshot_bronze_state() -> str:
     value = compute_bronze_fingerprint()
     write_hdfs_text(CURRENT_BRONZE_STATE, value)
-    # Keep the old control-file name for compatibility with earlier runs.
     write_hdfs_text(LEGACY_BRONZE_STATE, value)
     return value
 
@@ -416,9 +417,6 @@ def snapshot_bronze_state() -> str:
 # ---------------------------------------------------------------------------
 # Idempotent downstream stages
 # ---------------------------------------------------------------------------
-# Every stage fingerprints BOTH its upstream data state and the code that
-# creates it. If outputs already exist and no stage fingerprint exists yet,
-# we bootstrap the fingerprint without rebuilding the existing project.
 STAGES = {
     "silver": {
         "parent": "bronze",
@@ -426,10 +424,7 @@ STAGES = {
             ("spark-master", "/opt/project/bronze_to_silver.py"),
             ("spark-master", "/opt/project/validate_final_silver.py"),
         ],
-        "output": (
-            "namenode",
-            "hdfs dfs -test -e /nyc-taxi/silver/trips/_SUCCESS",
-        ),
+        "output": ("namenode", hdfs_has_parquet("/nyc-taxi/silver/trips")),
         "build": (
             "spark-master",
             [
@@ -462,8 +457,8 @@ STAGES = {
         "output": (
             "namenode",
             " && ".join(
-                f"hdfs dfs -test -e /nyc-taxi/gold/{t}/_SUCCESS"
-                for t in GOLD_TABLES
+                hdfs_has_parquet(f"/nyc-taxi/gold/{table}")
+                for table in GOLD_TABLES
             ),
         ),
         "build": (
@@ -496,9 +491,9 @@ STAGES = {
             "spark-master",
             " && ".join(
                 "[ -n \"$(find /opt/dashboard-data/"
-                f"{t} -maxdepth 1 -type f -name '*.parquet' -print -quit "
+                f"{table} -maxdepth 1 -type f -name '*.parquet' -print -quit "
                 "2>/dev/null)\" ]"
-                for t in GOLD_TABLES
+                for table in GOLD_TABLES
             ),
         ),
         "build": (
@@ -514,13 +509,12 @@ STAGES = {
     },
     "ml_dataset": {
         "parent": "silver",
-        "code": [
-            ("spark-master", "/opt/project/build_duration_ml_dataset.py")
-        ],
+        "code": [("spark-master", "/opt/project/build_duration_ml_dataset.py")],
         "output": (
             "namenode",
-            "hdfs dfs -test -e /nyc-taxi/ml/duration_dataset/train/_SUCCESS "
-            "&& hdfs dfs -test -e /nyc-taxi/ml/duration_dataset/test/_SUCCESS",
+            hdfs_has_parquet("/nyc-taxi/ml/duration_dataset/train")
+            + " && "
+            + hdfs_has_parquet("/nyc-taxi/ml/duration_dataset/test"),
         ),
         "build": (
             "spark-master",
@@ -543,10 +537,10 @@ STAGES = {
             "hdfs dfs -test -e /nyc-taxi/ml/models/duration/linear/metadata "
             "&& hdfs dfs -test -e /nyc-taxi/ml/models/duration/rf/metadata "
             "&& hdfs dfs -test -e /nyc-taxi/ml/models/duration/gbt/metadata "
-            "&& hdfs dfs -test -e "
-            "/nyc-taxi/ml/metrics/duration_model_comparison/_SUCCESS "
-            "&& hdfs dfs -test -e "
-            "/nyc-taxi/ml/predictions/duration/2025-12/_SUCCESS",
+            "&& "
+            + hdfs_has_parquet("/nyc-taxi/ml/metrics/duration_model_comparison")
+            + " && "
+            + hdfs_has_parquet("/nyc-taxi/ml/predictions/duration/2025-12"),
         ),
         "build": (
             "spark-master",
@@ -562,10 +556,7 @@ STAGES = {
     "ml_export": {
         "parent": "ml_dataset",
         "code": [
-            (
-                "spark-master",
-                "/opt/project/export_ml_dataset_for_deployment.py",
-            )
+            ("spark-master", "/opt/project/export_ml_dataset_for_deployment.py")
         ],
         "output": (
             "spark-master",
@@ -599,6 +590,17 @@ STAGES = {
 }
 
 
+STAGE_TASK_IDS = {
+    "silver": "ensure_silver",
+    "gold": "ensure_gold",
+    "dashboard_export": "ensure_dashboard_export",
+    "ml_dataset": "ensure_ml_dataset",
+    "spark_models": "ensure_spark_models",
+    "ml_export": "ensure_ml_export",
+    "portable_model": "ensure_portable_model",
+}
+
+
 def desired_stage_fingerprint(stage: str) -> str:
     if stage == "bronze":
         current = read_hdfs_text(CURRENT_BRONZE_STATE)
@@ -614,7 +616,7 @@ def desired_stage_fingerprint(stage: str) -> str:
     ]
     if stage == "portable_model":
         code_fps.append(ml_trainer_image_fingerprint())
-    return fingerprint(f"{stage}-v4", parent_fp, *code_fps)
+    return fingerprint(f"{stage}-v5", parent_fp, *code_fps)
 
 
 def stage_output_exists(stage: str) -> bool:
@@ -627,30 +629,42 @@ def execute_command(spec):
     exec_in_service(service, command, expected_text=expected_text)
 
 
-def ensure_stage(stage: str) -> str:
+def ensure_stage(stage: str, parent_task_id: str | None = None, **context) -> str:
     desired = desired_stage_fingerprint(stage)
     previous = read_hdfs_text(state_path(stage))
     exists = stage_output_exists(stage)
 
+    parent_status = None
+    if parent_task_id:
+        parent_status = context["ti"].xcom_pull(task_ids=parent_task_id)
+
     log.info("%s previous fingerprint: %s", stage, previous)
     log.info("%s desired fingerprint : %s", stage, desired)
     log.info("%s outputs exist       : %s", stage, exists)
+    log.info("%s parent status       : %s", stage, parent_status)
 
     if exists and previous == desired:
-        log.info("%s is unchanged; existing output will be reused.", stage)
+        log.info("%s unchanged; existing output will be reused.", stage)
         return "unchanged"
 
-    # Critical first-run behavior: do not rebuild the already-finished project
-    # just because the new orchestration state files do not exist yet.
-    if exists and previous is None:
+    # First run of the new orchestration: adopt existing validated artifacts
+    # without rebuilding. However, if the direct parent rebuilt in THIS run,
+    # a downstream output with no state is stale and must be rebuilt.
+    if exists and previous is None and parent_status != "rebuilt":
         write_hdfs_text(state_path(stage), desired)
         log.info(
-            "%s bootstrapped from the existing output WITHOUT rebuilding.",
+            "%s bootstrapped from existing output WITHOUT rebuilding.",
             stage,
         )
         return "bootstrapped"
 
-    reason = "output missing" if not exists else "input/code changed"
+    reason = "output missing"
+    if exists:
+        if parent_status == "rebuilt":
+            reason = "upstream stage rebuilt in this run"
+        else:
+            reason = "input or stage code changed"
+
     log.info("%s will rebuild because %s.", stage, reason)
 
     spec = STAGES[stage]
@@ -658,16 +672,17 @@ def ensure_stage(stage: str) -> str:
         spec["build_callable"]()
     else:
         execute_command(spec["build"])
+
     if spec.get("validate"):
         execute_command(spec["validate"])
 
     if not stage_output_exists(stage):
         raise AirflowException(
-            f"{stage} finished, but its expected output was not found."
+            f"{stage} finished, but expected Parquet/artifact output "
+            "was not found."
         )
 
     write_hdfs_text(state_path(stage), desired)
-
     log.info("%s rebuilt successfully.", stage)
     return "rebuilt"
 
@@ -676,6 +691,7 @@ def refresh_streamlit_if_needed(**context) -> str:
     statuses = context["ti"].xcom_pull(
         task_ids=["ensure_dashboard_export", "ensure_portable_model"]
     ) or []
+
     if not any(status == "rebuilt" for status in statuses):
         log.info("Serving artifacts unchanged; Streamlit restart not needed.")
         return "unchanged"
@@ -709,9 +725,8 @@ default_args = {
 with DAG(
     dag_id="nyc_taxi_full_pipeline",
     description=(
-        "End-to-end idempotent NYC Taxi pipeline. Each stage checks its "
-        "upstream fingerprint, code checksum and existing output before "
-        "deciding whether to rebuild."
+        "End-to-end idempotent NYC Taxi pipeline. Every stage reuses its "
+        "existing output unless upstream state or stage code changed."
     ),
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
@@ -721,20 +736,25 @@ with DAG(
     tags=["nyc-taxi", "big-data", "spark", "ml", "idempotent"],
 ) as dag:
     start = EmptyOperator(task_id="start")
+
     check_services = PythonOperator(
         task_id="check_required_services",
         python_callable=check_required_services,
     )
+
     batch_ready = PythonOperator(
         task_id="ensure_batch_and_reference",
         python_callable=ensure_batch_and_reference,
         execution_timeout=timedelta(hours=2),
     )
+
     stream_ready = PythonOperator(
         task_id="verify_streaming_bronze",
         python_callable=verify_streaming_bronze,
     )
+
     bronze_ready = EmptyOperator(task_id="bronze_ready")
+
     bronze_snapshot = PythonOperator(
         task_id="snapshot_bronze_fingerprint",
         python_callable=snapshot_bronze_state,
@@ -743,49 +763,57 @@ with DAG(
     silver_ready = PythonOperator(
         task_id="ensure_silver",
         python_callable=ensure_stage,
-        op_args=["silver"],
+        op_kwargs={"stage": "silver", "parent_task_id": None},
         execution_timeout=timedelta(hours=4),
     )
+
     gold_ready = PythonOperator(
         task_id="ensure_gold",
         python_callable=ensure_stage,
-        op_args=["gold"],
+        op_kwargs={"stage": "gold", "parent_task_id": "ensure_silver"},
         execution_timeout=timedelta(hours=3),
     )
+
     dashboard_ready = PythonOperator(
         task_id="ensure_dashboard_export",
         python_callable=ensure_stage,
-        op_args=["dashboard_export"],
+        op_kwargs={"stage": "dashboard_export", "parent_task_id": "ensure_gold"},
         execution_timeout=timedelta(hours=1),
     )
+
     ml_dataset_ready = PythonOperator(
         task_id="ensure_ml_dataset",
         python_callable=ensure_stage,
-        op_args=["ml_dataset"],
+        op_kwargs={"stage": "ml_dataset", "parent_task_id": "ensure_silver"},
         execution_timeout=timedelta(hours=2),
     )
+
     spark_models_ready = PythonOperator(
         task_id="ensure_spark_models",
         python_callable=ensure_stage,
-        op_args=["spark_models"],
+        op_kwargs={"stage": "spark_models", "parent_task_id": "ensure_ml_dataset"},
         execution_timeout=timedelta(hours=2),
     )
+
     ml_export_ready = PythonOperator(
         task_id="ensure_ml_export",
         python_callable=ensure_stage,
-        op_args=["ml_export"],
+        op_kwargs={"stage": "ml_export", "parent_task_id": "ensure_ml_dataset"},
         execution_timeout=timedelta(hours=1),
     )
+
     portable_model_ready = PythonOperator(
         task_id="ensure_portable_model",
         python_callable=ensure_stage,
-        op_args=["portable_model"],
+        op_kwargs={"stage": "portable_model", "parent_task_id": "ensure_ml_export"},
         execution_timeout=timedelta(hours=1),
     )
+
     refresh_streamlit = PythonOperator(
         task_id="refresh_local_streamlit",
         python_callable=refresh_streamlit_if_needed,
     )
+
     complete = EmptyOperator(task_id="pipeline_complete")
 
     start >> check_services
@@ -793,15 +821,9 @@ with DAG(
     check_services >> stream_ready
     [batch_ready, stream_ready] >> bronze_ready >> bronze_snapshot
 
-    (
-        bronze_snapshot
-        >> silver_ready
-        >> gold_ready
-        >> dashboard_ready
-        >> ml_dataset_ready
-        >> spark_models_ready
-        >> ml_export_ready
-        >> portable_model_ready
-        >> refresh_streamlit
-        >> complete
-    )
+    bronze_snapshot >> silver_ready >> gold_ready >> dashboard_ready
+    silver_ready >> ml_dataset_ready
+    ml_dataset_ready >> spark_models_ready
+    ml_dataset_ready >> ml_export_ready >> portable_model_ready
+    [dashboard_ready, spark_models_ready, portable_model_ready] >> refresh_streamlit
+    refresh_streamlit >> complete
