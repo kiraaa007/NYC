@@ -2,7 +2,7 @@
 
 A hybrid **batch + streaming Big Data project** built on five years of NYC TLC Yellow Taxi data, covering **January 2021 through December 2025 (60 months)**.
 
-The project combines Hadoop HDFS, Apache Kafka, Apache Spark, Spark Structured Streaming, Apache Airflow, machine learning, Docker, and Streamlit to build an end-to-end data platform from raw taxi trip files to analytics, geospatial visualization, and trip-duration prediction.
+The project combines Hadoop HDFS, Apache Kafka, Apache Spark, Spark Structured Streaming, Apache Airflow, machine learning, Docker, and Streamlit to build an end-to-end platform from raw taxi trip files to analytics, geospatial visualization, and trip-duration prediction.
 
 ## Live Project
 
@@ -11,7 +11,7 @@ The project combines Hadoop HDFS, Apache Kafka, Apache Spark, Spark Structured S
 
 ---
 
-## 1. Project Architecture
+## Architecture
 
 ```text
 NYC Yellow Taxi monthly Parquet files
@@ -43,392 +43,357 @@ NYC Yellow Taxi monthly Parquet files
                 v
           HDFS Silver Trips
                 |
-        +-------+--------+
-        |                |
-        v                v
-   Spark Gold         ML Dataset
-   Aggregations       + Feature Engineering
-        |                |
-        v                v
- Dashboard Export    Model Training
-        |                |
-        |          Portable .pkl Model
-        +-------+--------+
-                |
-                v
-             Streamlit
-    Analytics + Map + ML Predictor
+        +-------+------------------+
+        |                          |
+        v                          v
+  Spark Silver -> Gold       ML Dataset Builder
+        |                          |
+        v                          v
+  Gold serving tables       Spark model comparison
+        |                          |
+        v                          v
+ Dashboard export            ML train/test export
+        |                          |
+        |                          v
+        |                  Portable .pkl model
+        |                          |
+        +-------------+------------+
+                      |
+                      v
+                  Streamlit
+       analytics + map + ML prediction
 ```
 
-The project intentionally keeps the large raw and processed trip data in HDFS. Streamlit consumes only compact Gold-layer exports, the taxi-zone reference files, and the portable ML model.
+The full taxi dataset remains in HDFS. Streamlit only consumes compact Gold exports, taxi-zone reference files, and the portable model artifact.
 
 ---
 
-## 2. Dataset Scope
+## Data Scope
 
-The project uses NYC TLC **Yellow Taxi** monthly Parquet files for:
+- **Dataset:** NYC TLC Yellow Taxi trip records
+- **Period:** January 2021 through December 2025
+- **Total months:** 60
+- **Batch months:** 59
+- **Streaming month:** December 2025 (`2025-12`)
+- **Final Silver rows:** 198,091,763 in the completed project state
 
-```text
-2021-01 through 2025-12
-60 total months
-```
-
-The final ingestion split is:
-
-```text
-Batch ingestion     : 59 months
-Streaming ingestion : 2025-12 only
-```
-
-December 2025 is deliberately excluded from the batch loader and is instead replayed row-by-row through Kafka to simulate a finite streaming workload.
-
-Static reference data includes:
-
-```text
-taxi_zone_lookup.csv
-taxi_zones.shp
-taxi_zones.dbf
-taxi_zones.shx
-taxi_zones.prj
-taxi_zones.cpg
-```
-
-The taxi-zone files are loaded as reference data and are never sent through Kafka.
+December 2025 is intentionally excluded from normal batch ingestion and is simulated as a finite stream through Kafka.
 
 ---
 
-## 3. Technology Stack
+## Docker Services
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| Containerization | Docker Compose | Runs the project services in one reproducible environment |
-| Distributed storage | Hadoop HDFS | Stores Bronze, Silver, Gold, checkpoints, controls, and references |
-| Batch ingestion | Python + WebHDFS | Loads historical monthly Parquet files into HDFS |
-| Streaming ingestion | Apache Kafka | Simulates one live month of taxi trips |
-| Streaming processing | Spark Structured Streaming | Consumes Kafka and writes streaming Bronze data to HDFS |
-| Batch processing | Apache Spark | Cleans, normalizes, joins, aggregates, and prepares ML data |
-| Orchestration | Apache Airflow | Coordinates ingestion and Bronze -> Silver -> Gold workflows |
-| ML | Spark ML + scikit-learn | Model comparison and deployable trip-duration model |
-| Visualization | Streamlit + Plotly + GeoPandas | Dashboard, demand patterns, map, and ML inference |
-| Deployment | Streamlit Community Cloud | Hosts the final interactive application |
+`docker-compose.yml` provides the local Big Data environment:
 
----
+- `namenode` — HDFS NameNode
+- `datanode` — HDFS DataNode
+- `kafka` — Kafka broker/controller in KRaft mode
+- `kafka-init` — creates `nyc_taxi_stream`
+- `spark-master` — Spark master and job submission container
+- `spark-worker` — Spark worker
+- `ingestion` — batch loader + Kafka producer
+- `airflow-postgres` — Airflow metadata database
+- `airflow-webserver` — Airflow UI
+- `airflow-scheduler` — executes the DAGs through Docker
+- `ml-trainer` — one-shot portable-model trainer under the `training` profile
+- `streamlit-dashboard` — local analytics and prediction UI
 
-## 4. Docker Services
-
-`docker-compose.yml` defines the full local environment:
-
-| Service | Role |
-|---|---|
-| `namenode` | HDFS NameNode |
-| `datanode` | HDFS DataNode |
-| `kafka` | Kafka broker/controller in KRaft mode |
-| `kafka-init` | Creates topic `nyc_taxi_stream` |
-| `spark-master` | Spark standalone master |
-| `spark-worker` | Spark worker |
-| `ingestion` | Runs the batch loader and Kafka producer |
-| `airflow-postgres` | Airflow metadata database |
-| `airflow-init` | Initializes the Airflow database and admin user |
-| `airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | Executes Airflow DAGs and Docker tasks |
-| `ml-trainer` | Trains the portable deployment model |
-| `streamlit-dashboard` | Runs the local Streamlit application |
-
-HDFS uses persistent Docker volumes. Kafka is used as a transient streaming transport; HDFS and Spark checkpoints provide the durable processing state.
+HDFS data is persisted in Docker volumes. Do **not** use `docker compose down -v` unless you intentionally want to delete the HDFS state.
 
 ---
 
-## 5. Ingestion Layer
+## Ingestion
 
-### `ingestion/hdfs_batch_loader.py`
+### Batch ingestion
 
-Loads historical Yellow Taxi Parquet files to HDFS Bronze while excluding the configured streaming month.
+`ingestion/hdfs_batch_loader.py`
 
-Main behavior:
+- discovers the monthly Yellow Taxi Parquet files
+- excludes `2025-12`
+- uploads the other 59 months to HDFS Bronze
+- uploads Taxi Zone Lookup + shapefile reference files
+- creates `_SUCCESS` markers per loaded month
+- skips months/reference data that are already complete
 
-```text
-Historical Parquet -> HDFS /nyc-taxi/bronze/batch/year=YYYY/month=MM
-```
-
-It also uploads the taxi-zone reference files to:
-
-```text
-/nyc-taxi/reference
-```
-
-The loader is idempotent. After a month is successfully loaded it writes a marker under:
+Batch layout:
 
 ```text
-/nyc-taxi/control/batch_loaded/YYYY-MM/_SUCCESS
+/nyc-taxi/bronze/batch/
+  year=YYYY/
+    month=MM/
 ```
 
-Existing successful months are skipped on later runs.
+Reference data:
 
-### `ingestion/kafka_streaming_producer.py`
+```text
+/nyc-taxi/reference/
+```
 
-Simulates streaming for exactly one monthly Parquet file: **2025-12**.
+### Streaming ingestion
 
-Each taxi trip is serialized as JSON and sent as an individual Kafka message to:
+`ingestion/kafka_streaming_producer.py`
+
+Reads the December 2025 Parquet file incrementally and publishes one taxi trip per Kafka message to:
 
 ```text
 nyc_taxi_stream
 ```
 
-The file is read incrementally with PyArrow batches so millions of rows are not loaded into memory at once.
+It sends one final EOF control message after all trips are published.
 
-At the end, the producer sends one control record:
+`spark/spark_streaming_consumer.py`
 
-```json
-{"__eof__": true, "year_month": "2025-12"}
-```
-
----
-
-## 6. Streaming Layer
-
-### `spark/spark_streaming_consumer.py`
-
-Consumes `nyc_taxi_stream` using Spark Structured Streaming.
-
-It performs ingestion only:
-
-```text
-Kafka -> Spark Structured Streaming -> HDFS Bronze Streaming
-```
-
-Output:
+Consumes Kafka with Spark Structured Streaming and writes raw streaming records to:
 
 ```text
 /nyc-taxi/bronze/streaming/year=2025/month=12
 ```
 
-The consumer keeps the taxi payload raw as JSON and preserves Kafka metadata:
-
-```text
-kafka_topic
-kafka_partition
-kafka_offset
-kafka_timestamp
-```
-
-The EOF message is filtered out.
-
-A Spark checkpoint is maintained at:
-
-```text
-/nyc-taxi/checkpoints/streaming_ingestion
-```
-
-This allows Spark to resume from committed Kafka offsets rather than replaying already processed records.
+The consumer preserves raw JSON plus Kafka partition, offset, and timestamp metadata. Cleaning is intentionally deferred to Silver.
 
 ---
 
-## 7. Airflow Orchestration
+## Airflow Orchestration
 
-The project contains two Airflow DAGs.
+There are two Airflow DAGs.
 
-### `airflow/dags/nyc_taxi_streaming_pipeline.py`
+### 1. `nyc_taxi_streaming_ingestion`
 
-DAG ID:
-
-```text
-nyc_taxi_streaming_ingestion
-```
-
-Flow:
+Defined in:
 
 ```text
-Check services
--> Ensure Kafka topic
--> Inspect current streaming state
--> Start Spark streaming consumer when required
--> Run Kafka producer
--> Wait for Kafka/Spark completion
--> Stop consumer
--> Write HDFS success marker
+airflow/dags/nyc_taxi_streaming_pipeline.py
 ```
 
-The DAG is idempotent and contains recovery logic for a Kafka broker reset. If HDFS Bronze plus Spark checkpoints prove the complete stream was already committed, it blocks producer replay to prevent duplicate December data.
-
-### `airflow/dags/nyc_taxi_pipeline.py`
-
-DAG ID:
+It manages the finite December 2025 Kafka ingestion:
 
 ```text
-nyc_taxi_batch_to_gold
+check services
+-> ensure Kafka topic
+-> inspect existing Kafka/Spark/HDFS state
+-> start Spark streaming consumer only if needed
+-> run Kafka producer only if needed
+-> wait for final committed offset
+-> stop consumer
+-> write streaming success marker
 ```
 
-Flow:
+The DAG is idempotent. It also handles the case where Kafka broker state was reset but the durable Spark checkpoint and HDFS Bronze output prove that the stream had already completed. In that case, replay is blocked to avoid duplicates.
+
+### 2. `nyc_taxi_full_pipeline`
+
+Defined in:
 
 ```text
-Check services
--> Batch + reference ingestion
--> Verify Batch Bronze
--> Verify Streaming Bronze
--> Detect whether Bronze/reference state changed
--> Build Silver only if required
--> Validate Silver
--> Build Gold
--> Validate Gold
--> Record pipeline fingerprint
+airflow/dags/nyc_taxi_pipeline.py
 ```
 
-A SHA-256 fingerprint is generated from durable Bronze/reference state. If the fingerprint has not changed, Airflow skips the expensive Silver and Gold rebuild.
+This is the main end-to-end orchestration DAG:
+
+```text
+check services
+-> ensure batch + reference data
+-> verify streaming Bronze
+-> snapshot Bronze fingerprint
+-> ensure Silver
+-> ensure Gold
+-> ensure dashboard export
+-> ensure ML dataset
+-> ensure Spark model comparison
+-> ensure ML train/test export
+-> ensure portable .pkl model
+-> refresh local Streamlit only if serving artifacts changed
+-> complete
+```
+
+### Stage-by-stage idempotency
+
+The full DAG is specifically designed **not to rebuild the completed project every time it runs**.
+
+For each downstream stage Airflow records a fingerprint in:
+
+```text
+/nyc-taxi/control/pipeline_state/
+```
+
+Examples:
+
+```text
+silver.sha256
+gold.sha256
+dashboard_export.sha256
+ml_dataset.sha256
+spark_models.sha256
+ml_export.sha256
+portable_model.sha256
+```
+
+A stage fingerprint is based on its upstream data fingerprint plus the checksum/version of the code that produces that stage.
+
+Before executing a stage, Airflow asks:
+
+```text
+1. Does the expected output already exist?
+2. Is there a saved fingerprint for this stage?
+3. Does the current fingerprint match the previous fingerprint?
+```
+
+Behavior:
+
+```text
+output exists + fingerprint unchanged
+    -> reuse existing output
+    -> NO rebuild
+
+output exists + no stage fingerprint yet
+    -> bootstrap the new state file
+    -> NO rebuild
+
+output missing
+    -> rebuild that stage
+
+upstream data/code fingerprint changed
+    -> rebuild that stage
+    -> downstream dependent stages detect the new fingerprint themselves
+```
+
+This bootstrap rule is important because the project was already completed before the full orchestration logic was added. The first run of the new DAG records the current state instead of unnecessarily rebuilding hundreds of millions of rows.
+
+The Bronze fingerprint includes HDFS batch/streaming state, success markers, HDFS file checksums, the Spark streaming checkpoint/commit, and taxi-zone reference checksums.
+
+### Change propagation examples
+
+If nothing changed:
+
+```text
+Silver        reuse
+Gold          reuse
+Dashboard     reuse
+ML dataset    reuse
+Spark models  reuse
+ML export     reuse
+.pkl model    reuse
+```
+
+If only `build_gold.py` changes:
+
+```text
+Silver        reuse
+Gold          rebuild
+Dashboard     rebuild
+ML dataset    reuse
+Spark models  reuse
+ML export     reuse
+.pkl model    reuse
+```
+
+If Bronze/Silver changes:
+
+```text
+Silver        rebuild
+Gold          rebuild
+Dashboard     rebuild
+ML dataset    rebuild
+Spark models  rebuild
+ML export     rebuild
+.pkl model    rebuild
+```
+
+If only the dashboard-export code changes, only the serving export is regenerated.
 
 ---
 
-## 8. Bronze -> Silver Processing
+## Silver Layer
 
-### `spark/bronze_to_silver.py`
+`spark/bronze_to_silver.py`
 
-This is the main transformation job.
+The job:
 
-Batch Bronze contains normal Parquet columns, while Streaming Bronze contains raw JSON. The job converts both sources into one canonical schema and unions them.
-
-It also handles schema drift across TLC years. Columns missing from a particular month are safely represented as null rather than breaking the full multi-year read.
-
-Silver cleaning is intentionally conservative. Structurally unusable records are removed, including missing timestamps, invalid pickup month, dropoff before pickup, missing pickup/dropoff location IDs, negative distance, and negative passenger count.
-
-The job derives:
-
-```text
-trip_duration_minutes
-pickup_date
-pickup_year
-pickup_month
-pickup_day
-pickup_hour
-pickup_day_of_week
-```
-
-It then joins `taxi_zone_lookup.csv` twice to enrich both pickup and dropoff IDs with:
-
-```text
-Zone
-Borough
-service_zone
-```
+1. reads every batch month independently to handle TLC schema drift
+2. parses the streaming Bronze raw JSON
+3. normalizes batch + streaming records into one canonical schema
+4. unions both ingestion paths
+5. applies conservative structural cleaning
+6. calculates trip-duration and pickup-time features
+7. joins the Taxi Zone Lookup for pickup and dropoff enrichment
+8. writes partitioned Silver Parquet
 
 Output:
 
 ```text
-/nyc-taxi/silver/trips
+/nyc-taxi/silver/trips/
+  pickup_year=YYYY/
+    pickup_month=MM/
 ```
 
-partitioned by:
-
-```text
-pickup_year
-pickup_month
-```
-
-Final Silver contains **198,091,763 trips** across **60 year-month partitions**.
+Silver preserves an `ingestion_source` field so batch and streaming records remain traceable after the union.
 
 ---
 
-## 9. Silver -> Gold Analytics
+## Gold Layer
 
-### `spark/build_gold.py`
+`spark/build_gold.py`
 
-Builds compact serving tables for analytics and Streamlit.
+Builds compact analytics tables:
 
-Output tables:
+- `daily_summary`
+- `hourly_demand`
+- `pickup_zone_monthly`
+- `payment_monthly`
 
-| Gold Table | Purpose |
-|---|---|
-| `daily_summary` | Daily trips, revenue, distance, duration, tips, passenger metrics |
-| `hourly_demand` | Demand by hour and day of week |
-| `pickup_zone_monthly` | Monthly pickup-zone performance and geographic analytics |
-| `payment_monthly` | Monthly metrics by payment type |
+These tables contain metrics such as trip count, revenue, average fare, average tip, trip distance, trip duration, and passenger count.
 
-All final Gold tables reconcile back to **198,091,763 Silver trips** and cover all **60 months**.
-
-### Validation files
-
-- `spark/validate_silver_tests.py` - development validation for sample batch/streaming Silver outputs
-- `spark/validate_final_silver.py` - final Silver row, partition, source, and zone-enrichment checks
-- `spark/validate_gold_test.py` - development Gold inspection
-- `spark/validate_final_gold.py` - final 60-month coverage and trip-count reconciliation
+`spark/validate_final_gold.py` reconciles each Gold table against the **current Silver output**, rather than relying on a hard-coded historical row count. This allows legitimate future Silver changes to be validated correctly.
 
 ---
 
-## 10. Dashboard Export
+## Machine Learning
 
-### `spark/export_dashboard_data.py`
-
-Streamlit does not read the full Silver dataset.
-
-This job exports the compact Gold tables from HDFS to:
-
-```text
-streamlit/data/
-```
-
-The deployed dashboard therefore reads only small pre-aggregated Parquet serving tables instead of scanning the full Big Data dataset.
-
----
-
-## 11. Machine Learning
-
-The ML target is:
+Target:
 
 ```text
 trip_duration_minutes
 ```
 
-### `spark/build_duration_ml_dataset.py`
+### ML dataset
 
-Creates prediction-time features from Silver and uses a temporal train/test split:
+`spark/build_duration_ml_dataset.py`
 
-```text
-Train : 2021-01 through 2025-11
-Test  : 2025-12
-```
-
-ML-specific quality filters constrain duration, distance, passenger count, location IDs, rate codes, and time fields.
-
-Features include pickup/dropoff location, passenger count, distance, rate code, pickup hour/month/day, weekend/rush-hour indicators, and cyclical hour/month features.
-
-### `spark/train_duration_models.py`
-
-Compares distributed Spark ML regressors:
+Temporal split:
 
 ```text
-Mean baseline
-Linear Regression
-Random Forest Regressor
-Gradient-Boosted Trees Regressor
+Train: 2021-01 through 2025-11
+Test : 2025-12
 ```
 
-Metrics:
+The features include pickup/dropoff location, passenger count, trip distance, rate code, time fields, weekend/rush-hour flags, and cyclical hour/month features.
+
+### Spark model comparison
+
+`spark/train_duration_models.py`
+
+Compares:
+
+- mean baseline
+- Linear Regression
+- Random Forest
+- Gradient-Boosted Trees
+
+Evaluation metrics:
+
+- MAE
+- RMSE
+- R²
+
+### Portable deployment model
+
+Spark ML models require a Spark/JVM runtime, so deployment uses a separate portable model trained by:
 
 ```text
-MAE
-RMSE
-R²
+ml_training/train_deployable_model.py
 ```
 
-The best trained Spark model is selected by RMSE and persisted to HDFS.
-
-### `spark/predict_trip_duration.py`
-
-Provides command-line inference for the persisted Spark GBT pipeline and verifies that the saved Spark model can be reloaded successfully.
-
----
-
-## 12. Portable Deployment Model
-
-The deployed Streamlit application does not start Spark for every prediction.
-
-### `spark/export_ml_dataset_for_deployment.py`
-
-Exports the sampled Spark ML train/test datasets from HDFS to local `ml_artifacts/data/` for portable model training.
-
-### `ml_training/train_deployable_model.py`
-
-Trains a scikit-learn `HistGradientBoostingRegressor` pipeline with target encoding for categorical IDs and saves it using Joblib.
-
-Artifacts:
+It creates:
 
 ```text
 ml_artifacts/trip_duration_model.pkl
@@ -436,78 +401,49 @@ ml_artifacts/trip_duration_model_metrics.json
 ml_artifacts/trip_duration_model_features.json
 ```
 
-Current deployed model evaluation on unseen **December 2025** data:
+Current portable-model metrics:
 
-| Metric | Result |
-|---|---:|
-| Training rows | 841,051 |
-| Test rows | 143,109 |
-| MAE | 4.415 min |
-| RMSE | 6.996 min |
-| R² | 0.7688 |
+- Training rows: **841,051**
+- Test rows: **143,109**
+- Test period: **2025-12**
+- MAE: **4.415 min**
+- RMSE: **6.996 min**
+- R²: **0.7688**
 
-The `.pkl` model is loaded directly by Streamlit for lightweight inference.
+For automated future retraining, the Docker image only needs to be built once:
+
+```bash
+docker compose --profile training build ml-trainer
+```
+
+Airflow can then run the one-shot trainer through Docker only when its upstream ML export or trainer image version changes.
 
 ---
 
-## 13. Streamlit Application
+## Streamlit
 
-Entry point:
+Main entry point:
 
 ```text
 streamlit/app.py
 ```
 
-### Overview
+Pages:
 
-Displays:
+- **Overview** — total trips, revenue, average duration/distance, daily trends
+- **Taxi Zone Map** — interactive choropleth by trip count, revenue, duration, distance, or tip
+- **Demand Patterns** — day/hour heatmap + hourly pickup-demand curve
+- **Trip Duration Predictor** — direct inference from the deployed `.pkl` model
 
-```text
-Trips
-Revenue
-Average trip duration
-Average trip distance
-Daily trip volume
-Daily revenue
-```
+`spark/export_dashboard_data.py` exports the compact Gold serving tables to `streamlit/data/`.
 
-### `streamlit/pages/1_Zone_Map.py`
+The deployed Streamlit app does **not** run Hadoop, Kafka, Spark, or Airflow for each visitor. Those systems create the serving artifacts; Streamlit only reads the compact outputs.
 
-Interactive NYC taxi-zone choropleth using the TLC shapefile and Gold `pickup_zone_monthly` table.
-
-Users can select year, month, and map metric such as trip count, revenue, average duration, average distance, or average tip.
-
-### `streamlit/pages/2_Demand_Patterns.py`
-
-Displays:
-
-```text
-Day-of-week x hour demand heatmap
-Hourly pickup-demand line chart
-```
-
-### `streamlit/pages/3_Trip_Duration_Predictor.py`
-
-Loads `trip_duration_model.pkl` directly and predicts the planned taxi-trip duration from:
-
-```text
-Pickup zone
-Dropoff zone
-Passenger count
-Estimated trip distance
-Pickup date/time
-Rate code
-```
-
-The page also displays the saved test MAE, RMSE, and R² metrics.
-
-### `streamlit/utils.py`
-
-Shared loader and caching functions for Gold tables, taxi-zone lookup data, and the taxi-zone shapefile. It supports both Docker paths and repository-relative Streamlit Community Cloud paths.
+The Airflow DAG can refresh the local Docker Streamlit container when dashboard/model artifacts are rebuilt. Streamlit Community Cloud deployment remains a separate GitHub deployment concern; the DAG does not automatically commit or push generated artifacts to GitHub.
 
 ---
 
-## 14. Repository Structure
+## Repository Structure
 
 ```text
 NYC/
@@ -516,24 +452,25 @@ NYC/
 │       ├── nyc_taxi_pipeline.py
 │       └── nyc_taxi_streaming_pipeline.py
 ├── ingestion/
-│   ├── Dockerfile
 │   ├── hdfs_batch_loader.py
 │   ├── kafka_streaming_producer.py
+│   ├── Dockerfile
 │   └── requirements.txt
 ├── spark/
 │   ├── spark_streaming_consumer.py
 │   ├── bronze_to_silver.py
 │   ├── build_gold.py
+│   ├── validate_final_silver.py
+│   ├── validate_final_gold.py
 │   ├── build_duration_ml_dataset.py
 │   ├── train_duration_models.py
-│   ├── predict_trip_duration.py
-│   ├── export_dashboard_data.py
 │   ├── export_ml_dataset_for_deployment.py
-│   └── validation scripts
+│   ├── export_dashboard_data.py
+│   └── predict_trip_duration.py
 ├── ml_training/
+│   ├── train_deployable_model.py
 │   ├── Dockerfile
-│   ├── requirements.txt
-│   └── train_deployable_model.py
+│   └── requirements.txt
 ├── ml_artifacts/
 │   ├── trip_duration_model.pkl
 │   ├── trip_duration_model_metrics.json
@@ -541,10 +478,9 @@ NYC/
 ├── streamlit/
 │   ├── app.py
 │   ├── utils.py
-│   ├── requirements.txt
+│   ├── pages/
 │   ├── data/
-│   ├── assets/taxi_zones/
-│   └── pages/
+│   └── assets/taxi_zones/
 ├── docker-compose.yml
 ├── hadoop.env
 ├── .env.example
@@ -553,76 +489,44 @@ NYC/
 
 ---
 
-## 15. Local Setup
+## Running the Project
 
-Create `.env` from `.env.example` and point it to the local NYC dataset:
+Create `.env` from `.env.example` and point `NYC_DATA_PATH` to the local NYC data directory. The final streaming month is:
 
 ```env
-NYC_DATA_PATH=C:/path/to/NYC Data
 STREAMING_MONTH=2025-12
 ```
 
-Expected local data layout:
-
-```text
-NYC Data/
-├── trip_records/
-│   ├── yellow_tripdata_2021-01.parquet
-│   ├── ...
-│   └── yellow_tripdata_2025-12.parquet
-└── taxi_zones/
-    ├── taxi_zone_lookup.csv
-    ├── taxi_zones.shp
-    ├── taxi_zones.dbf
-    ├── taxi_zones.shx
-    ├── taxi_zones.prj
-    └── taxi_zones.cpg
-```
-
-Start the environment:
+Start the infrastructure:
 
 ```bash
 docker compose up -d --build
 ```
 
-Useful local UIs:
+Build the optional trainer image once so Airflow can retrain the portable model if it ever becomes necessary:
 
-```text
-HDFS NameNode : http://localhost:9870
-Spark Master  : http://localhost:8080
-Spark Worker  : http://localhost:8081
-Airflow       : http://localhost:8082
-Streamlit     : http://localhost:8501
+```bash
+docker compose --profile training build ml-trainer
 ```
 
-Do not run `docker compose down -v` unless the HDFS Docker volumes are intentionally being deleted.
+Useful UIs:
 
----
+- HDFS NameNode: `http://localhost:9870`
+- Spark Master: `http://localhost:8080`
+- Spark Worker: `http://localhost:8081`
+- Airflow: `http://localhost:8082`
+- Streamlit: `http://localhost:8501`
 
-## 16. Final Pipeline Summary
+Run the streaming DAG first if December 2025 streaming Bronze has not already been completed:
 
 ```text
-5 years / 60 months of NYC Yellow Taxi data
-                    |
-          59 Batch + 1 Streaming
-                    |
-          HDFS Bronze storage
-                    |
-       Spark normalization + cleaning
-                    |
-              HDFS Silver
-          198,091,763 trips
-                    |
-        +-----------+-----------+
-        |                       |
-   Gold analytics            ML pipeline
-        |                       |
-        v                       v
- Streamlit visualizations   .pkl predictor
-        +-----------+-----------+
-                    |
-                    v
-          Deployed Streamlit App
+nyc_taxi_streaming_ingestion
 ```
 
-This repository represents the final project implementation. The current source code, Airflow DAGs, final validation scripts, ML artifacts, and Streamlit application are the source of truth for the project architecture and behavior.
+Then run the full orchestration DAG:
+
+```text
+nyc_taxi_full_pipeline
+```
+
+On an already-completed project, the first run should primarily **bootstrap fingerprints and reuse the existing outputs**, not rebuild the entire pipeline.
