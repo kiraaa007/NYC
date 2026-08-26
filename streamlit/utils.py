@@ -8,8 +8,21 @@ import pandas as pd
 import streamlit as st
 
 
-DATA_DIR = Path(os.getenv("DASHBOARD_DATA_DIR", "/app/data"))
-NYC_DATA_DIR = Path(os.getenv("NYC_DATA_DIR", "/data"))
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_DIR = Path(
+    os.getenv(
+        "DASHBOARD_DATA_DIR",
+        str(BASE_DIR / "data")
+    )
+)
+
+NYC_DATA_DIR = Path(
+    os.getenv(
+        "NYC_DATA_DIR",
+        str(BASE_DIR / "assets")
+    )
+)
 
 
 @st.cache_data(show_spinner=False)
