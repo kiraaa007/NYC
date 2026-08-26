@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import hashlib
@@ -9,8 +8,7 @@ import docker
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import BranchPythonOperator, PythonOperator
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.operators.python import PythonOperator
 
 log = logging.getLogger(__name__)
 
@@ -20,10 +18,19 @@ REFERENCE_DIR = "/data/taxi_zones"
 
 SILVER_PATH = "hdfs://namenode:9000/nyc-taxi/silver/trips"
 GOLD_PATH = "hdfs://namenode:9000/nyc-taxi/gold"
-STREAMING_BRONZE_HDFS = "/nyc-taxi/bronze/streaming/year=2025/month=12"
+ML_DATASET_BASE = "hdfs://namenode:9000/nyc-taxi/ml/duration_dataset"
 
+STREAMING_BRONZE_HDFS = "/nyc-taxi/bronze/streaming/year=2025/month=12"
 PIPELINE_STATE_DIR = "/nyc-taxi/control/pipeline_state"
-PIPELINE_FINGERPRINT_FILE = f"{PIPELINE_STATE_DIR}/bronze_fingerprint.sha256"
+LEGACY_BRONZE_STATE = f"{PIPELINE_STATE_DIR}/bronze_fingerprint.sha256"
+CURRENT_BRONZE_STATE = f"{PIPELINE_STATE_DIR}/bronze_current.sha256"
+
+GOLD_TABLES = [
+    "daily_summary",
+    "hourly_demand",
+    "pickup_zone_monthly",
+    "payment_monthly",
+]
 
 REQUIRED_SERVICES = {
     "namenode",
@@ -34,6 +41,10 @@ REQUIRED_SERVICES = {
     "ingestion",
 }
 
+
+# ---------------------------------------------------------------------------
+# Docker helpers
+# ---------------------------------------------------------------------------
 
 def docker_client():
     try:
@@ -66,7 +77,6 @@ def exec_in_service(
     expected_text: str | None = None,
 ) -> str:
     client, container = find_service_container(service)
-
     exec_info = client.api.exec_create(
         container=container.id,
         cmd=command,
@@ -74,13 +84,7 @@ def exec_in_service(
         stderr=True,
     )
     exec_id = exec_info["Id"]
-
-    chunks = client.api.exec_start(
-        exec_id,
-        stream=True,
-        demux=True,
-    )
-
+    chunks = client.api.exec_start(exec_id, stream=True, demux=True)
     output_parts: list[str] = []
 
     for stdout_chunk, stderr_chunk in chunks:
@@ -89,7 +93,6 @@ def exec_in_service(
             output_parts.append(text)
             for line in text.rstrip().splitlines():
                 log.info("[%s] %s", service, line)
-
         if stderr_chunk:
             text = stderr_chunk.decode("utf-8", errors="replace")
             output_parts.append(text)
@@ -97,19 +100,16 @@ def exec_in_service(
                 log.warning("[%s] %s", service, line)
 
     result = client.api.exec_inspect(exec_id)
-    exit_code = result.get("ExitCode")
     output = "".join(output_parts)
-
-    if exit_code != 0:
+    if result.get("ExitCode") != 0:
         raise AirflowException(
-            f"Command failed in service {service} with exit code {exit_code}."
+            f"Command failed in service {service} "
+            f"with exit code {result.get('ExitCode')}."
         )
-
     if expected_text is not None and expected_text not in output:
         raise AirflowException(
             f"Expected text not found in {service} output: {expected_text!r}"
         )
-
     return output
 
 
@@ -128,7 +128,81 @@ def check_required_services():
         )
 
 
-def load_batch_and_reference():
+def service_file_checksum(service: str, path: str) -> str:
+    output = exec_in_service(service, ["sha256sum", path]).strip()
+    if not output:
+        raise AirflowException(f"Could not checksum {service}:{path}")
+    return output.split()[0]
+
+
+# ---------------------------------------------------------------------------
+# Persistent stage state in HDFS
+# ---------------------------------------------------------------------------
+
+def fingerprint(*parts: str) -> str:
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def state_path(stage: str) -> str:
+    return f"{PIPELINE_STATE_DIR}/{stage}.sha256"
+
+
+def read_hdfs_text(path: str) -> str | None:
+    output = exec_in_service(
+        "namenode",
+        [
+            "sh",
+            "-lc",
+            f"if hdfs dfs -test -e {path}; then hdfs dfs -cat {path}; fi",
+        ],
+    ).strip()
+    return output.splitlines()[-1].strip() if output else None
+
+
+def write_hdfs_text(path: str, value: str):
+    temp_name = path.rsplit("/", 1)[-1].replace(".", "_")
+    exec_in_service(
+        "namenode",
+        [
+            "sh",
+            "-lc",
+            f"hdfs dfs -mkdir -p {PIPELINE_STATE_DIR} && "
+            f"printf '%s\\n' '{value}' > /tmp/{temp_name} && "
+            f"hdfs dfs -put -f /tmp/{temp_name} {path}",
+        ],
+    )
+
+
+def shell_check(service: str, condition: str) -> bool:
+    output = exec_in_service(
+        service,
+        ["sh", "-lc", f"if {condition}; then echo YES; else echo NO; fi"],
+    ).strip()
+    return output.splitlines()[-1] == "YES"
+
+
+# ---------------------------------------------------------------------------
+# Bronze readiness and fingerprint
+# ---------------------------------------------------------------------------
+
+def batch_and_reference_complete() -> bool:
+    return shell_check(
+        "namenode",
+        "count=$(hdfs dfs -ls /nyc-taxi/control/batch_loaded 2>/dev/null "
+        "| awk '$1 ~ /^d/ {count++} END {print count+0}'); "
+        "[ \"$count\" -eq 59 ] && "
+        "hdfs dfs -test -e /nyc-taxi/control/reference_loaded/_SUCCESS",
+    )
+
+
+def ensure_batch_and_reference() -> str:
+    if batch_and_reference_complete():
+        log.info(
+            "59 batch months and reference data already exist; "
+            "batch/reference ingestion is unchanged."
+        )
+        return "unchanged"
+
     exec_in_service(
         "ingestion",
         [
@@ -143,226 +217,392 @@ def load_batch_and_reference():
         ],
     )
 
-
-def verify_batch_bronze():
-    output = exec_in_service(
-        "namenode",
-        [
-            "sh",
-            "-lc",
-            "hdfs dfs -ls /nyc-taxi/control/batch_loaded 2>/dev/null "
-            "| awk '$1 ~ /^d/ {count++} END {print count+0}'",
-        ],
-    ).strip()
-
-    count = int(output.splitlines()[-1])
-    if count != 59:
+    if not batch_and_reference_complete():
         raise AirflowException(
-            f"Expected 59 batch success markers, found {count}."
+            "Batch/reference ingestion finished but expected success markers "
+            "were not found."
         )
+    return "rebuilt"
 
 
-def verify_streaming_bronze():
-    exec_in_service(
-        "namenode",
-        ["hdfs", "dfs", "-test", "-e", STREAMING_BRONZE_HDFS],
+def verify_streaming_bronze() -> str:
+    condition = (
+        f"hdfs dfs -test -e {STREAMING_BRONZE_HDFS} && "
+        f"[ $(hdfs dfs -ls {STREAMING_BRONZE_HDFS} 2>/dev/null "
+        "| grep -c '\\.parquet$' || true) -gt 0 ]"
     )
-
-    output = exec_in_service(
-        "namenode",
-        [
-            "sh",
-            "-lc",
-            f"hdfs dfs -ls {STREAMING_BRONZE_HDFS} 2>/dev/null "
-            "| grep -c '\\.parquet$' || true",
-        ],
-    ).strip()
-
-    parquet_count = int(output.splitlines()[-1])
-    if parquet_count <= 0:
+    if not shell_check("namenode", condition):
         raise AirflowException(
-            "Streaming Bronze directory exists but contains no Parquet files."
+            "Streaming Bronze is missing. Run nyc_taxi_streaming_ingestion "
+            "first."
         )
+    return "ready"
 
 
 def compute_bronze_fingerprint() -> str:
-    shell_script = r'''
-set -e
-
-echo "[batch_month_markers]"
-hdfs dfs -ls /nyc-taxi/control/batch_loaded 2>/dev/null \
-  | awk '$1 ~ /^d/ {print $8}' \
-  | sort
-
-echo "[streaming_final_offset]"
-latest=$(
-  hdfs dfs -ls /nyc-taxi/checkpoints/streaming_ingestion/offsets 2>/dev/null \
-    | awk '{print $8}' \
-    | awk -F/ '{print $NF}' \
-    | grep -E '^[0-9]+$' \
-    | sort -n \
-    | tail -1
-)
-
-if [ -n "$latest" ]; then
-  hdfs dfs -cat "/nyc-taxi/checkpoints/streaming_ingestion/offsets/$latest" \
-    | tail -1
-else
-  echo "NONE"
-fi
-
-echo "[streaming_bronze_size]"
-hdfs dfs -du -s /nyc-taxi/bronze/streaming/year=2025/month=12 \
-  2>/dev/null || echo "NONE"
-
-echo "[taxi_lookup_checksum]"
-hdfs dfs -checksum /nyc-taxi/reference/taxi_zone_lookup.csv \
-  2>/dev/null || echo "NONE"
-'''
-
     manifest = exec_in_service(
         "namenode",
-        ["sh", "-lc", shell_script],
+        [
+            "sh",
+            "-lc",
+            r'''
+set -e
+
+echo "[batch_markers]"
+for d in $(hdfs dfs -ls /nyc-taxi/control/batch_loaded 2>/dev/null \
+  | awk '$1 ~ /^d/ {print $8}' | sort); do
+  echo "$d"
+  hdfs dfs -cat "$d/_SUCCESS" 2>/dev/null || echo MISSING
+done
+
+echo "[batch_size]"
+hdfs dfs -du -s /nyc-taxi/bronze/batch 2>/dev/null || echo NONE
+
+echo "[batch_file_checksums]"
+for f in $(hdfs dfs -find /nyc-taxi/bronze/batch -name '*.parquet' 2>/dev/null | sort); do
+  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
+done
+
+echo "[stream_checkpoint]"
+latest=$(hdfs dfs -ls /nyc-taxi/checkpoints/streaming_ingestion/offsets \
+  2>/dev/null | awk '{print $8}' | awk -F/ '{print $NF}' \
+  | grep -E '^[0-9]+$' | sort -n | tail -1)
+if [ -n "$latest" ]; then
+  echo "batch=$latest"
+  hdfs dfs -cat "/nyc-taxi/checkpoints/streaming_ingestion/offsets/$latest" \
+    | tail -1
+  if hdfs dfs -test -e "/nyc-taxi/checkpoints/streaming_ingestion/commits/$latest"; then
+    echo "commit=YES"
+  else
+    echo "commit=NO"
+  fi
+else
+  echo NONE
+fi
+
+echo "[stream_size]"
+hdfs dfs -du -s /nyc-taxi/bronze/streaming/year=2025/month=12 \
+  2>/dev/null || echo NONE
+
+echo "[stream_file_checksums]"
+for f in $(hdfs dfs -find /nyc-taxi/bronze/streaming/year=2025/month=12 \
+  -name '*.parquet' 2>/dev/null | sort); do
+  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
+done
+
+echo "[lookup_checksum]"
+hdfs dfs -checksum /nyc-taxi/reference/taxi_zone_lookup.csv \
+  2>/dev/null || echo NONE
+
+echo "[zone_reference_checksums]"
+for f in $(hdfs dfs -ls /nyc-taxi/reference/taxi_zones 2>/dev/null \
+  | awk '$1 !~ /^d/ && $8 != "" {print $8}' | sort); do
+  hdfs dfs -checksum "$f" 2>/dev/null || echo "MISSING:$f"
+done
+''',
+        ],
     )
-
-    fingerprint = hashlib.sha256(
-        manifest.encode("utf-8")
-    ).hexdigest()
-
-    log.info("Bronze fingerprint: %s", fingerprint)
-    return fingerprint
+    value = fingerprint(manifest)
+    log.info("Bronze fingerprint: %s", value)
+    return value
 
 
-def read_previous_fingerprint() -> str | None:
-    output = exec_in_service(
-        "namenode",
-        [
-            "sh",
-            "-lc",
-            f"if hdfs dfs -test -e {PIPELINE_FINGERPRINT_FILE}; then "
-            f"hdfs dfs -cat {PIPELINE_FINGERPRINT_FILE}; fi",
+def snapshot_bronze_state() -> str:
+    value = compute_bronze_fingerprint()
+    write_hdfs_text(CURRENT_BRONZE_STATE, value)
+    # Keep the old control-file name for compatibility with earlier runs.
+    write_hdfs_text(LEGACY_BRONZE_STATE, value)
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Idempotent downstream stages
+# ---------------------------------------------------------------------------
+# Every stage fingerprints BOTH its upstream data state and the code that
+# creates it. If outputs already exist and no stage fingerprint exists yet,
+# we bootstrap the fingerprint without rebuilding the existing project.
+STAGES = {
+    "silver": {
+        "parent": "bronze",
+        "code": [
+            ("spark-master", "/opt/project/bronze_to_silver.py"),
+            ("spark-master", "/opt/project/validate_final_silver.py"),
         ],
-    ).strip()
-
-    return output.splitlines()[-1].strip() if output else None
-
-
-def write_fingerprint(fingerprint: str):
-    exec_in_service(
-        "namenode",
-        [
-            "sh",
-            "-lc",
-            f"hdfs dfs -mkdir -p {PIPELINE_STATE_DIR} && "
-            f"printf '%s\\n' '{fingerprint}' > /tmp/bronze_fingerprint && "
-            f"hdfs dfs -put -f /tmp/bronze_fingerprint "
-            f"{PIPELINE_FINGERPRINT_FILE}",
+        "output": (
+            "namenode",
+            "hdfs dfs -test -e /nyc-taxi/silver/trips/_SUCCESS",
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/bronze_to_silver.py",
+                "--output-path",
+                SILVER_PATH,
+            ],
+            "BRONZE -> SILVER COMPLETE",
+        ),
+        "validate": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/validate_final_silver.py",
+            ],
+            "FINAL SILVER VALIDATION COMPLETE",
+        ),
+    },
+    "gold": {
+        "parent": "silver",
+        "code": [
+            ("spark-master", "/opt/project/build_gold.py"),
+            ("spark-master", "/opt/project/validate_final_gold.py"),
         ],
-    )
-
-
-def completed_outputs_exist() -> bool:
-    output = exec_in_service(
-        "namenode",
-        [
-            "sh",
-            "-lc",
-            "if "
-            "hdfs dfs -test -e /nyc-taxi/silver/trips/_SUCCESS && "
-            "hdfs dfs -test -e /nyc-taxi/gold/daily_summary/_SUCCESS && "
-            "hdfs dfs -test -e /nyc-taxi/gold/hourly_demand/_SUCCESS && "
-            "hdfs dfs -test -e /nyc-taxi/gold/pickup_zone_monthly/_SUCCESS && "
-            "hdfs dfs -test -e /nyc-taxi/gold/payment_monthly/_SUCCESS; "
-            "then echo YES; else echo NO; fi",
+        "output": (
+            "namenode",
+            " && ".join(
+                f"hdfs dfs -test -e /nyc-taxi/gold/{t}/_SUCCESS"
+                for t in GOLD_TABLES
+            ),
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/build_gold.py",
+                "--output-base",
+                GOLD_PATH,
+            ],
+            "SILVER -> GOLD COMPLETE",
+        ),
+        "validate": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/validate_final_gold.py",
+            ],
+            "OVERALL RESULT: PASS",
+        ),
+    },
+    "dashboard_export": {
+        "parent": "gold",
+        "code": [("spark-master", "/opt/project/export_dashboard_data.py")],
+        "output": (
+            "spark-master",
+            " && ".join(
+                "[ -n \"$(find /opt/dashboard-data/"
+                f"{t} -maxdepth 1 -type f -name '*.parquet' -print -quit "
+                "2>/dev/null)\" ]"
+                for t in GOLD_TABLES
+            ),
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/export_dashboard_data.py",
+            ],
+            "DASHBOARD DATA EXPORT COMPLETE",
+        ),
+    },
+    "ml_dataset": {
+        "parent": "silver",
+        "code": [
+            ("spark-master", "/opt/project/build_duration_ml_dataset.py")
         ],
-    ).strip()
+        "output": (
+            "namenode",
+            "hdfs dfs -test -e /nyc-taxi/ml/duration_dataset/train/_SUCCESS "
+            "&& hdfs dfs -test -e /nyc-taxi/ml/duration_dataset/test/_SUCCESS",
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/build_duration_ml_dataset.py",
+                "--output-base",
+                ML_DATASET_BASE,
+            ],
+            "ML DATASET BUILD COMPLETE",
+        ),
+    },
+    "spark_models": {
+        "parent": "ml_dataset",
+        "code": [("spark-master", "/opt/project/train_duration_models.py")],
+        "output": (
+            "namenode",
+            "hdfs dfs -test -e /nyc-taxi/ml/models/duration/linear/metadata "
+            "&& hdfs dfs -test -e /nyc-taxi/ml/models/duration/rf/metadata "
+            "&& hdfs dfs -test -e /nyc-taxi/ml/models/duration/gbt/metadata "
+            "&& hdfs dfs -test -e "
+            "/nyc-taxi/ml/metrics/duration_model_comparison/_SUCCESS "
+            "&& hdfs dfs -test -e "
+            "/nyc-taxi/ml/predictions/duration/2025-12/_SUCCESS",
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/train_duration_models.py",
+            ],
+            "TRIP DURATION MODEL TRAINING COMPLETE",
+        ),
+    },
+    "ml_export": {
+        "parent": "ml_dataset",
+        "code": [
+            (
+                "spark-master",
+                "/opt/project/export_ml_dataset_for_deployment.py",
+            )
+        ],
+        "output": (
+            "spark-master",
+            "[ -n \"$(find /opt/ml-artifacts/data/train -maxdepth 1 -type f "
+            "-name '*.parquet' -print -quit 2>/dev/null)\" ] "
+            "&& [ -n \"$(find /opt/ml-artifacts/data/test -maxdepth 1 -type f "
+            "-name '*.parquet' -print -quit 2>/dev/null)\" ]",
+        ),
+        "build": (
+            "spark-master",
+            [
+                "/opt/spark/bin/spark-submit",
+                "--master",
+                "spark://spark-master:7077",
+                "/opt/project/export_ml_dataset_for_deployment.py",
+            ],
+            "ML DEPLOYMENT DATA EXPORT COMPLETE",
+        ),
+    },
+    "portable_model": {
+        "parent": "ml_export",
+        "code": [
+            ("spark-master", "/opt/ml-training/train_deployable_model.py"),
+            ("spark-master", "/opt/ml-training/requirements.txt"),
+        ],
+        "output": (
+            "spark-master",
+            "[ -s /opt/ml-artifacts/trip_duration_model.pkl ] "
+            "&& [ -s /opt/ml-artifacts/trip_duration_model_metrics.json ] "
+            "&& [ -s /opt/ml-artifacts/trip_duration_model_features.json ]",
+        ),
+        "build": (
+            "ml-trainer",
+            ["python", "/trainer/train_deployable_model.py"],
+            "PORTABLE MODEL TRAINING COMPLETE",
+        ),
+    },
+}
 
-    return output.splitlines()[-1] == "YES"
+
+def desired_stage_fingerprint(stage: str) -> str:
+    if stage == "bronze":
+        current = read_hdfs_text(CURRENT_BRONZE_STATE)
+        if current is None:
+            current = snapshot_bronze_state()
+        return current
+
+    spec = STAGES[stage]
+    parent_fp = desired_stage_fingerprint(spec["parent"])
+    code_fps = [
+        service_file_checksum(service, path)
+        for service, path in spec["code"]
+    ]
+    return fingerprint(f"{stage}-v3", parent_fp, *code_fps)
 
 
-def choose_rebuild_path():
-    current = compute_bronze_fingerprint()
-    previous = read_previous_fingerprint()
+def stage_output_exists(stage: str) -> bool:
+    service, condition = STAGES[stage]["output"]
+    return shell_check(service, condition)
 
-    log.info("Previous fingerprint: %s", previous)
-    log.info("Current fingerprint : %s", current)
 
-    if previous == current:
-        log.info("Bronze unchanged. Skipping Silver and Gold rebuild.")
-        return "skip_rebuild"
+def execute_command(spec):
+    service, command, expected_text = spec
+    exec_in_service(service, command, expected_text=expected_text)
 
-    if previous is None and completed_outputs_exist():
+
+def ensure_stage(stage: str) -> str:
+    desired = desired_stage_fingerprint(stage)
+    previous = read_hdfs_text(state_path(stage))
+    exists = stage_output_exists(stage)
+
+    log.info("%s previous fingerprint: %s", stage, previous)
+    log.info("%s desired fingerprint : %s", stage, desired)
+    log.info("%s outputs exist       : %s", stage, exists)
+
+    if exists and previous == desired:
+        log.info("%s is unchanged; existing output will be reused.", stage)
+        return "unchanged"
+
+    # Critical first-run behavior: do not rebuild the already-finished project
+    # just because the new orchestration state files do not exist yet.
+    if exists and previous is None:
+        write_hdfs_text(state_path(stage), desired)
         log.info(
-            "Bootstrapping current completed Silver/Gold state. "
-            "No expensive rebuild required."
+            "%s bootstrapped from the existing output WITHOUT rebuilding.",
+            stage,
         )
-        write_fingerprint(current)
-        return "skip_rebuild"
+        return "bootstrapped"
 
-    return "build_silver"
+    reason = "output missing" if not exists else "input/code changed"
+    log.info("%s will rebuild because %s.", stage, reason)
+
+    spec = STAGES[stage]
+    execute_command(spec["build"])
+    if spec.get("validate"):
+        execute_command(spec["validate"])
+
+    if not stage_output_exists(stage):
+        raise AirflowException(
+            f"{stage} finished, but its expected output was not found."
+        )
+
+    write_hdfs_text(state_path(stage), desired)
+
+    log.info("%s rebuilt successfully.", stage)
+    return "rebuilt"
 
 
-def build_silver():
-    exec_in_service(
-        "spark-master",
-        [
-            "/opt/spark/bin/spark-submit",
-            "--master",
-            "spark://spark-master:7077",
-            "/opt/project/bronze_to_silver.py",
-            "--output-path",
-            SILVER_PATH,
-        ],
-        expected_text="BRONZE -> SILVER COMPLETE",
+def refresh_streamlit_if_needed(**context) -> str:
+    statuses = context["ti"].xcom_pull(
+        task_ids=["ensure_dashboard_export", "ensure_portable_model"]
+    ) or []
+    if not any(status == "rebuilt" for status in statuses):
+        log.info("Serving artifacts unchanged; Streamlit restart not needed.")
+        return "unchanged"
+
+    client = docker_client()
+    containers = client.containers.list(
+        filters={
+            "label": "com.docker.compose.service=streamlit-dashboard",
+            "status": "running",
+        }
     )
+    if not containers:
+        log.info("Local Streamlit is not running; nothing to restart.")
+        return "not_running"
+
+    containers[0].restart(timeout=15)
+    log.info("Local Streamlit restarted to load new serving artifacts.")
+    return "restarted"
 
 
-def validate_silver():
-    exec_in_service(
-        "spark-master",
-        [
-            "/opt/spark/bin/spark-submit",
-            "--master",
-            "spark://spark-master:7077",
-            "/opt/project/validate_final_silver.py",
-        ],
-        expected_text="FINAL SILVER VALIDATION COMPLETE",
-    )
-
-
-def build_gold():
-    exec_in_service(
-        "spark-master",
-        [
-            "/opt/spark/bin/spark-submit",
-            "--master",
-            "spark://spark-master:7077",
-            "/opt/project/build_gold.py",
-            "--output-base",
-            GOLD_PATH,
-        ],
-        expected_text="SILVER -> GOLD COMPLETE",
-    )
-
-
-def validate_gold():
-    exec_in_service(
-        "spark-master",
-        [
-            "/opt/spark/bin/spark-submit",
-            "--master",
-            "spark://spark-master:7077",
-            "/opt/project/validate_final_gold.py",
-        ],
-        expected_text="OVERALL RESULT: PASS",
-    )
-
-
-def record_successful_pipeline_state():
-    current = compute_bronze_fingerprint()
-    write_fingerprint(current)
-
-
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
 default_args = {
     "owner": "nyc-taxi-team",
     "depends_on_past": False,
@@ -371,100 +611,101 @@ default_args = {
 }
 
 with DAG(
-    dag_id="nyc_taxi_batch_to_gold",
+    dag_id="nyc_taxi_full_pipeline",
     description=(
-        "Idempotent NYC Taxi orchestration: rebuild Silver/Gold only when "
-        "Bronze/reference state changes."
+        "End-to-end idempotent NYC Taxi pipeline. Each stage checks its "
+        "upstream fingerprint, code checksum and existing output before "
+        "deciding whether to rebuild."
     ),
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     max_active_runs=1,
-    tags=["nyc-taxi", "big-data", "hdfs", "spark", "idempotent"],
+    tags=["nyc-taxi", "big-data", "spark", "ml", "idempotent"],
 ) as dag:
-
     start = EmptyOperator(task_id="start")
-
     check_services = PythonOperator(
         task_id="check_required_services",
         python_callable=check_required_services,
     )
-
-    batch_ingestion = PythonOperator(
-        task_id="load_batch_and_reference",
-        python_callable=load_batch_and_reference,
+    batch_ready = PythonOperator(
+        task_id="ensure_batch_and_reference",
+        python_callable=ensure_batch_and_reference,
         execution_timeout=timedelta(hours=2),
     )
-
-    check_batch = PythonOperator(
-        task_id="verify_batch_bronze",
-        python_callable=verify_batch_bronze,
-    )
-
-    check_stream = PythonOperator(
+    stream_ready = PythonOperator(
         task_id="verify_streaming_bronze",
         python_callable=verify_streaming_bronze,
     )
-
     bronze_ready = EmptyOperator(task_id="bronze_ready")
-
-    detect_bronze_change = BranchPythonOperator(
-        task_id="detect_bronze_change",
-        python_callable=choose_rebuild_path,
+    bronze_snapshot = PythonOperator(
+        task_id="snapshot_bronze_fingerprint",
+        python_callable=snapshot_bronze_state,
     )
 
-    skip_rebuild = EmptyOperator(task_id="skip_rebuild")
-
-    silver = PythonOperator(
-        task_id="build_silver",
-        python_callable=build_silver,
+    silver_ready = PythonOperator(
+        task_id="ensure_silver",
+        python_callable=ensure_stage,
+        op_args=["silver"],
+        execution_timeout=timedelta(hours=4),
+    )
+    gold_ready = PythonOperator(
+        task_id="ensure_gold",
+        python_callable=ensure_stage,
+        op_args=["gold"],
         execution_timeout=timedelta(hours=3),
     )
-
-    silver_validation = PythonOperator(
-        task_id="validate_silver",
-        python_callable=validate_silver,
+    dashboard_ready = PythonOperator(
+        task_id="ensure_dashboard_export",
+        python_callable=ensure_stage,
+        op_args=["dashboard_export"],
         execution_timeout=timedelta(hours=1),
     )
-
-    gold = PythonOperator(
-        task_id="build_gold",
-        python_callable=build_gold,
+    ml_dataset_ready = PythonOperator(
+        task_id="ensure_ml_dataset",
+        python_callable=ensure_stage,
+        op_args=["ml_dataset"],
         execution_timeout=timedelta(hours=2),
     )
-
-    gold_validation = PythonOperator(
-        task_id="validate_gold",
-        python_callable=validate_gold,
+    spark_models_ready = PythonOperator(
+        task_id="ensure_spark_models",
+        python_callable=ensure_stage,
+        op_args=["spark_models"],
+        execution_timeout=timedelta(hours=2),
+    )
+    ml_export_ready = PythonOperator(
+        task_id="ensure_ml_export",
+        python_callable=ensure_stage,
+        op_args=["ml_export"],
         execution_timeout=timedelta(hours=1),
     )
-
-    record_state = PythonOperator(
-        task_id="record_pipeline_state",
-        python_callable=record_successful_pipeline_state,
+    portable_model_ready = PythonOperator(
+        task_id="ensure_portable_model",
+        python_callable=ensure_stage,
+        op_args=["portable_model"],
+        execution_timeout=timedelta(hours=1),
     )
-
-    complete = EmptyOperator(
-        task_id="pipeline_complete",
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    refresh_streamlit = PythonOperator(
+        task_id="refresh_local_streamlit",
+        python_callable=refresh_streamlit_if_needed,
     )
+    complete = EmptyOperator(task_id="pipeline_complete")
 
     start >> check_services
-
-    check_services >> batch_ingestion >> check_batch
-    check_services >> check_stream
-
-    [check_batch, check_stream] >> bronze_ready >> detect_bronze_change
-
-    detect_bronze_change >> skip_rebuild >> complete
+    check_services >> batch_ready
+    check_services >> stream_ready
+    [batch_ready, stream_ready] >> bronze_ready >> bronze_snapshot
 
     (
-        detect_bronze_change
-        >> silver
-        >> silver_validation
-        >> gold
-        >> gold_validation
-        >> record_state
+        bronze_snapshot
+        >> silver_ready
+        >> gold_ready
+        >> dashboard_ready
+        >> ml_dataset_ready
+        >> spark_models_ready
+        >> ml_export_ready
+        >> portable_model_ready
+        >> refresh_streamlit
         >> complete
     )
